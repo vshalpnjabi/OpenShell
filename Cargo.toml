@@ -87,6 +87,12 @@ sha2 = "0.10"
 rand = "0.9"
 jsonwebtoken = "9"
 getrandom = "0.3"
+# Pin pkcs8 to the rc.11 that rsa 0.10.0-rc.12 compiles against.
+# Without this, a fresh `cargo install` (no --locked) can resolve to
+# pkcs8 0.11.0-rc.12 or 0.11.0 final which breaks rsa 0.10.0-rc.12 on macOS.
+# The pin must live in an actual [dependencies] block (openshell-sandbox) to
+# constrain the resolver; this workspace entry is the canonical declaration.
+pkcs8 = "=0.11.0-rc.11"
 
 # Filesystem embedding
 include_dir = "0.7"

@@ -3589,6 +3589,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "tracing",
 ]
 
 [[package]]
@@ -3656,9 +3657,11 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
+ "pkcs8 0.11.0-rc.11",
  "rand_core 0.6.4",
  "rcgen",
  "regorus",
+ "reqwest 0.12.28",
  "russh",
  "rustix 1.1.4",
  "rustls",
@@ -3682,6 +3685,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots 1.0.7",
+ "wiremock",
 ]
 
 [[package]]
