@@ -3151,17 +3151,21 @@ async fn handle_forward_proxy(
                     endpoint,
                     timeout,
                     fallback,
+                    secret,
                 },
             ) => {
-                // Redact credential query-params before sending to the decision
-                // endpoint, matching what the relay sites do with redacted_target.
+                // Redact credential query-params; when no resolver is present,
+                // strip the query string entirely to avoid leaking raw credentials.
                 let interactive_path = match secret_resolver.as_deref() {
                     Some(resolver) => {
                         crate::secrets::rewrite_target_for_eval(&upstream_target, resolver)
                             .map(|r| r.redacted)
                             .unwrap_or_else(|_| upstream_target.clone())
                     }
-                    None => upstream_target.clone(),
+                    None => upstream_target
+                        .split_once('?')
+                        .map(|(path, _)| path.to_string())
+                        .unwrap_or_else(|| upstream_target.clone()),
                 };
                 let ctx = crate::l7::interactive::InteractiveContext {
                     host: &host_lc,
@@ -3175,7 +3179,11 @@ async fn handle_forward_proxy(
                     sandbox_name: &crate::ocsf_ctx().sandbox_name,
                 };
                 match crate::l7::interactive::consult_interactive_endpoint(
-                    endpoint, *timeout, *fallback, &ctx,
+                    endpoint,
+                    *timeout,
+                    *fallback,
+                    secret.as_deref(),
+                    &ctx,
                 )
                 .await
                 {

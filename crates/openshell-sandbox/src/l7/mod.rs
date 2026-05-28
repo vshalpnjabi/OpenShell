@@ -94,6 +94,10 @@ pub enum EnforcementMode {
         timeout: std::time::Duration,
         /// Fallback applied on timeout / unreachable / malformed response.
         fallback: FallbackMode,
+        /// Bearer token sent as `Authorization: Bearer <secret>`. `None` when
+        /// the policy omits the `secret` field; a warning is emitted at parse
+        /// time and no auth header is added.
+        secret: Option<String>,
     },
 }
 
@@ -314,10 +318,19 @@ fn parse_enforcement_value(val: Option<&regorus::Value>) -> EnforcementMode {
                 Some("allow") => FallbackMode::Allow,
                 _ => FallbackMode::Deny,
             };
+            let secret = get_object_str(val, "secret").filter(|s| !s.is_empty());
+            if secret.is_none() {
+                tracing::warn!(
+                    endpoint,
+                    "interactive-enforcement: no 'secret' configured; \
+                     decision endpoint is unauthenticated"
+                );
+            }
             EnforcementMode::Interactive {
                 endpoint,
                 timeout,
                 fallback,
+                secret,
             }
         }
         _ => EnforcementMode::Audit,
@@ -1345,10 +1358,12 @@ mod tests {
                 endpoint,
                 timeout,
                 fallback,
+                secret,
             } => {
                 assert_eq!(endpoint, "http://host.openshell.internal:53789/decide");
                 assert_eq!(timeout, std::time::Duration::from_secs(30));
                 assert_eq!(fallback, FallbackMode::Allow);
+                assert_eq!(secret, None);
             }
             other => panic!("expected Interactive, got {other:?}"),
         }
@@ -1453,6 +1468,7 @@ mod tests {
                 endpoint: "http://host.example.internal/decide".into(),
                 timeout: INTERACTIVE_DEFAULT_TIMEOUT,
                 fallback: FallbackMode::Deny,
+                secret: None,
             }
         );
     }
@@ -1481,6 +1497,34 @@ mod tests {
                 endpoint: "http://host.example.internal/decide".into(),
                 timeout: INTERACTIVE_MAX_TIMEOUT,
                 fallback: FallbackMode::Deny,
+                secret: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_l7_config_interactive_with_secret() {
+        let val = regorus::Value::from_json_str(
+            r#"{
+                "protocol": "rest",
+                "host": "api.example.com",
+                "port": 443,
+                "enforcement": {
+                    "mode": "interactive",
+                    "endpoint": "http://host.example.internal/decide",
+                    "secret": "my-bearer-token"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(
+            config.enforcement,
+            EnforcementMode::Interactive {
+                endpoint: "http://host.example.internal/decide".into(),
+                timeout: INTERACTIVE_DEFAULT_TIMEOUT,
+                fallback: FallbackMode::Deny,
+                secret: Some("my-bearer-token".into()),
             }
         );
     }

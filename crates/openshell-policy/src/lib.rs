@@ -195,6 +195,10 @@ struct InteractiveEnforcementDef {
     /// `"allow"` or `"deny"`. Empty means "use the engine default" (deny).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     fallback: String,
+    /// Optional bearer token sent as `Authorization: Bearer <secret>` on every
+    /// POST. Absent → no auth header and a warning is emitted at startup.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    secret: String,
 }
 
 /// Serialize an `EnforcementDef` for storage in the proto's `string enforcement`
@@ -788,6 +792,13 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
+    /// An interactive enforcement endpoint URL resolves to a loopback or
+    /// link-local address, which can be used to reach internal services or
+    /// cloud metadata endpoints (e.g. 169.254.169.254).
+    UnsafeInteractiveEndpoint {
+        policy_name: String,
+        endpoint: String,
+    },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -822,6 +833,17 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
                      use subdomain wildcards like '*.example.com' instead"
+                )
+            }
+            Self::UnsafeInteractiveEndpoint {
+                policy_name,
+                endpoint,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': interactive enforcement endpoint \
+                     '{endpoint}' resolves to a loopback or link-local address; \
+                     use a hostname (e.g. host.openshell.internal) instead"
                 )
             }
         }
@@ -911,7 +933,8 @@ pub fn validate_sandbox_policy(
         }
     }
 
-    // Check network policy endpoint hosts for TLD wildcards.
+    // Check network policy endpoint hosts for TLD wildcards and unsafe
+    // interactive enforcement endpoints.
     for (key, rule) in &policy.network_policies {
         let name = if rule.name.is_empty() {
             key.clone()
@@ -926,6 +949,28 @@ pub fn validate_sandbox_policy(
                         policy_name: name.clone(),
                         host: ep.host.clone(),
                     });
+                }
+            }
+
+            // Reject interactive enforcement endpoints whose host is a raw IP
+            // in a loopback or link-local range.  These can reach the cloud
+            // instance metadata service (169.254.169.254) or other internal
+            // addresses.  Hostname-based endpoints (e.g. host.openshell.internal)
+            // are allowed; DNS resolution is controlled by the network namespace.
+            if ep.enforcement.trim_start().starts_with('{') {
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(ep.enforcement.trim()) {
+                    if obj.get("mode").and_then(|v| v.as_str()) == Some("interactive") {
+                        if let Some(endpoint_url) = obj.get("endpoint").and_then(|v| v.as_str()) {
+                            if let Some(host) = extract_url_host(endpoint_url) {
+                                if is_unsafe_ip_host(&host) {
+                                    violations.push(PolicyViolation::UnsafeInteractiveEndpoint {
+                                        policy_name: name.clone(),
+                                        endpoint: endpoint_url.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -944,6 +989,52 @@ fn truncate_for_display(s: &str) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..77])
+    }
+}
+
+/// Extract the host component from a URL string (no external dependencies).
+fn extract_url_host(url: &str) -> Option<String> {
+    // Strip scheme
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    // Strip userinfo
+    let rest = if let Some(at) = rest.find('@') {
+        &rest[at + 1..]
+    } else {
+        rest
+    };
+    // Strip path/query/fragment
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    // Strip port
+    let host = if host_port.starts_with('[') {
+        // IPv6 literal [::1]:port
+        host_port
+            .find(']')
+            .map(|i| &host_port[1..i])
+            .unwrap_or(host_port)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port)
+    };
+    Some(host.to_lowercase())
+}
+
+/// Return true if `host` is a raw IP address in a loopback or link-local range.
+fn is_unsafe_ip_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    // fe80::/10 link-local
+                    || (v6.segments()[0] & 0xffc0 == 0xfe80)
+            }
+        }
+    } else {
+        false
     }
 }
 
@@ -1479,6 +1570,75 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "example.com".into(),
                     port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_interactive_endpoint_link_local_ip() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    enforcement: r#"{"mode":"interactive","endpoint":"http://169.254.169.254/latest/meta-data/"}"#.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::UnsafeInteractiveEndpoint { .. })),
+            "expected UnsafeInteractiveEndpoint violation, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_interactive_endpoint_loopback_ip() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "loop".into(),
+            NetworkPolicyRule {
+                name: "loop-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    enforcement: r#"{"mode":"interactive","endpoint":"http://127.0.0.1:9000/decide"}"#.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::UnsafeInteractiveEndpoint { .. })),
+            "expected UnsafeInteractiveEndpoint violation, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_interactive_endpoint_hostname() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    enforcement: r#"{"mode":"interactive","endpoint":"http://host.openshell.internal:8080/decide"}"#.into(),
                     ..Default::default()
                 }],
                 ..Default::default()

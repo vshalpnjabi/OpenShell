@@ -336,6 +336,7 @@ where
                     endpoint,
                     timeout,
                     fallback,
+                    secret,
                 },
             ) => {
                 let interactive_ctx = crate::l7::interactive::InteractiveContext {
@@ -353,6 +354,7 @@ where
                     endpoint,
                     *timeout,
                     *fallback,
+                    secret.as_deref(),
                     &interactive_ctx,
                 )
                 .await
@@ -769,6 +771,7 @@ where
                     endpoint,
                     timeout,
                     fallback,
+                    secret,
                 },
                 _,
             ) => {
@@ -787,6 +790,7 @@ where
                     endpoint,
                     *timeout,
                     *fallback,
+                    secret.as_deref(),
                     &interactive_ctx,
                 )
                 .await
@@ -1043,6 +1047,7 @@ where
                     endpoint,
                     timeout,
                     fallback,
+                    secret,
                 },
             ) => {
                 let interactive_ctx = crate::l7::interactive::InteractiveContext {
@@ -1065,6 +1070,7 @@ where
                     endpoint,
                     *timeout,
                     *fallback,
+                    secret.as_deref(),
                     &interactive_ctx,
                 )
                 .await

@@ -102,6 +102,7 @@ temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 wiremock = "0.6"
+serial_test = "3"
 
 [lints]
 workspace = true

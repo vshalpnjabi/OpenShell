@@ -166,6 +166,7 @@ pub(crate) async fn consult_interactive_endpoint(
     endpoint: &str,
     timeout: Duration,
     fallback: FallbackMode,
+    secret: Option<&str>,
     ctx: &InteractiveContext<'_>,
 ) -> InteractiveDecision {
     tracing::debug!(
@@ -217,12 +218,11 @@ pub(crate) async fn consult_interactive_endpoint(
     );
 
     let timed = tokio::time::timeout(timeout, async {
-        let resp = INTERACTIVE_CLIENT
-            .post(endpoint)
-            .json(&body)
-            .send()
-            .await
-            .map_err(anyhow::Error::from)?;
+        let mut req = INTERACTIVE_CLIENT.post(endpoint).json(&body);
+        if let Some(token) = secret {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await.map_err(anyhow::Error::from)?;
 
         tracing::debug!(
             endpoint,
@@ -356,6 +356,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -380,6 +381,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Allow,
+            None,
             &ctx("api.example.com", "POST"),
         )
         .await;
@@ -402,6 +404,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -424,6 +427,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -444,6 +448,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Allow,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -468,6 +473,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -488,6 +494,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -511,6 +518,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -533,6 +541,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Allow,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -547,6 +556,7 @@ mod tests {
             "http://127.0.0.1:1/decide",
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -571,6 +581,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &InteractiveContext {
                 host: "github.com",
                 port: 443,
@@ -610,15 +621,68 @@ mod tests {
         );
     }
 
-    // ── semaphore ─────────────────────────────────────────────────────────────
+    // ── bearer auth ──────────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn bearer_secret_sent_as_authorization_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/decide"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer my-test-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"decision": "allow"})),
+            )
+            .mount(&server)
+            .await;
+
+        let decision = consult_interactive_endpoint(
+            &format!("{}/decide", server.uri()),
+            Duration::from_secs(5),
+            FallbackMode::Deny,
+            Some("my-test-token"),
+            &ctx("api.example.com", "GET"),
+        )
+        .await;
+
+        assert_eq!(decision, InteractiveDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn no_secret_sends_no_authorization_header() {
+        let server = MockServer::start().await;
+        // The mock only matches if no Authorization header is present;
+        // if a header were sent erroneously the mock would not match and
+        // wiremock would return 404, causing fallback.
+        Mock::given(method("POST"))
+            .and(path("/decide"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"decision": "allow"})),
+            )
+            .mount(&server)
+            .await;
+
+        let decision = consult_interactive_endpoint(
+            &format!("{}/decide", server.uri()),
+            Duration::from_secs(5),
+            FallbackMode::Deny,
+            None,
+            &ctx("api.example.com", "GET"),
+        )
+        .await;
+
+        assert_eq!(decision, InteractiveDecision::Allow);
+    }
+
+    // ── semaphore ─────────────────────────────────────────────────────────────
+
+    // Serialised to prevent deadlock: acquire_many(MAX_CONCURRENT) blocks until
+    // all permits are free; parallel tests that hold a permit would deadlock.
+    #[serial_test::serial]
+    #[tokio::test]
     async fn semaphore_exhausted_applies_fallback() {
-        // acquire_many(MAX_CONCURRENT) blocks until all permits are free.
-        // If another test in this module holds a permit concurrently this
-        // will deadlock.  Other tests complete quickly in practice; structural
-        // injection of a per-test semaphore would remove the risk but requires
-        // non-trivial refactoring.
         let permits = INTERACTIVE_SEMAPHORE
             .acquire_many(MAX_CONCURRENT as u32)
             .await
@@ -631,6 +695,7 @@ mod tests {
             "http://127.0.0.1:1/decide",
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &ctx("api.example.com", "GET"),
         )
         .await;
@@ -654,6 +719,7 @@ mod tests {
             &format!("{}/decide", server.uri()),
             Duration::from_secs(5),
             FallbackMode::Deny,
+            None,
             &InteractiveContext {
                 host: "example.com",
                 port: 80,
