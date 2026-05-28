@@ -10,6 +10,7 @@
 
 pub mod graphql;
 pub mod inference;
+pub(crate) mod interactive;
 pub mod path;
 pub mod provider;
 pub mod relay;
@@ -50,14 +51,47 @@ pub enum TlsMode {
     Skip,
 }
 
-/// Enforcement mode for L7 policy decisions.
+/// Fallback decision applied when the interactive decision endpoint is
+/// unreachable, times out, or returns a non-conforming response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FallbackMode {
+    /// Treat the unreachable endpoint as if it had answered "allow".
+    Allow,
+    /// Treat the unreachable endpoint as if it had answered "deny" (default,
+    /// fail-closed).
+    #[default]
+    Deny,
+}
+
+/// Default per-request timeout for an interactive enforcement decision.
+pub const INTERACTIVE_DEFAULT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Enforcement mode for L7 policy decisions.
+///
+/// `Interactive` carries a `String` so this enum is `Clone` rather than `Copy`.
+/// Callers that previously copied the value should pattern-match against a
+/// borrow or clone explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EnforcementMode {
     /// Log violations but allow traffic through (safe migration path).
     #[default]
     Audit,
     /// Deny violations — blocked requests never reach upstream.
     Enforce,
+    /// Hold the request open and consult an external HTTP decision endpoint
+    /// instead of returning 403 immediately. The proxy awaits the endpoint's
+    /// `{"decision":"allow"|"deny"}` response before forwarding or closing the
+    /// held connection.
+    Interactive {
+        /// Decision endpoint URL — POSTed a JSON request body, expected to
+        /// reply `{"decision":"allow"|"deny","reason":"…"}`.
+        endpoint: String,
+        /// Per-request decision timeout.
+        timeout: std::time::Duration,
+        /// Fallback applied on timeout / unreachable / malformed response.
+        fallback: FallbackMode,
+    },
 }
 
 /// L7 configuration for an endpoint, extracted from policy data.
@@ -148,10 +182,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         _ => TlsMode::Auto,
     };
 
-    let enforcement = match get_object_str(val, "enforcement").as_deref() {
-        Some("enforce") => EnforcementMode::Enforce,
-        _ => EnforcementMode::Audit,
-    };
+    let enforcement = parse_enforcement_value(get_object_value(val, "enforcement"));
 
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
     let websocket_credential_rewrite =
@@ -214,6 +245,78 @@ pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
         Some("skip") => TlsMode::Skip,
         // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
+    }
+}
+
+/// Parse the `enforcement` field from an endpoint config value.
+///
+/// Accepts three shapes from the regorus data document:
+///   * absent / non-string-non-object → `Audit` (default, fail-open migration).
+///   * bare string `"enforce"` / `"audit"` → the matching variant.
+///   * object `{ mode: "interactive", endpoint, timeout_seconds?, fallback? }`
+///     → `Interactive` with the parsed fields.
+///
+/// A malformed `interactive` object (missing `endpoint`) falls back to
+/// `Enforce` — interactive mode is opt-in and must specify a destination, so
+/// silently downgrading to `Audit` would mask a configuration error.
+fn parse_enforcement_value(val: Option<&regorus::Value>) -> EnforcementMode {
+    let Some(val) = val else {
+        return EnforcementMode::Audit;
+    };
+    match val {
+        regorus::Value::String(s) => match s.as_ref() {
+            "enforce" => EnforcementMode::Enforce,
+            "audit" => EnforcementMode::Audit,
+            // Unknown bare string: preserve historical fail-open behavior.
+            _ => EnforcementMode::Audit,
+        },
+        regorus::Value::Object(_) => {
+            let mode = get_object_str(val, "mode").unwrap_or_default();
+            if mode != "interactive" {
+                // Only { mode: "interactive", … } is valid; any other value
+                // is a misconfiguration — fall closed rather than silently
+                // degrading to Audit.
+                tracing::warn!(
+                    mode,
+                    "interactive-enforcement: unrecognized mode in enforcement object, \
+                     treating as misconfiguration → Enforce"
+                );
+                return EnforcementMode::Enforce;
+            }
+            let Some(endpoint) = get_object_str(val, "endpoint") else {
+                return EnforcementMode::Enforce;
+            };
+            // Reject non-http(s) schemes (e.g. file://, ftp://) to prevent
+            // the supervisor from being used as an SSRF vector.  Note: this
+            // does NOT block http:// to link-local or loopback addresses —
+            // those are operator-controlled and intentional for local watchers.
+            // Check is case-insensitive per RFC 3986 §3.1.
+            let ep_lower = endpoint.to_ascii_lowercase();
+            if !ep_lower.starts_with("http://") && !ep_lower.starts_with("https://") {
+                tracing::warn!(
+                    endpoint,
+                    "interactive-enforcement: endpoint must use http or https scheme, \
+                     treating as misconfiguration → Enforce"
+                );
+                return EnforcementMode::Enforce;
+            }
+            // timeout_seconds: 0 means "use default" (Duration::ZERO would
+            // cause every request to time out immediately).
+            let timeout = get_object_u64(val, "timeout_seconds")
+                .filter(|&s| s > 0)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(INTERACTIVE_DEFAULT_TIMEOUT);
+            let fallback = match get_object_str(val, "fallback").as_deref() {
+                Some("allow") => FallbackMode::Allow,
+                _ => FallbackMode::Deny,
+            };
+            EnforcementMode::Interactive {
+                endpoint,
+                timeout,
+                fallback,
+            }
+        }
+        _ => EnforcementMode::Audit,
     }
 }
 
@@ -1214,6 +1317,159 @@ mod tests {
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert_eq!(config.tls, TlsMode::Skip);
+    }
+
+    #[test]
+    fn parse_l7_config_interactive_object_form() {
+        let val = regorus::Value::from_json_str(
+            r#"{
+                "protocol": "rest",
+                "host": "api.example.com",
+                "port": 443,
+                "enforcement": {
+                    "mode": "interactive",
+                    "endpoint": "http://host.openshell.internal:53789/decide",
+                    "timeout_seconds": 30,
+                    "fallback": "allow"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        match config.enforcement {
+            EnforcementMode::Interactive {
+                endpoint,
+                timeout,
+                fallback,
+            } => {
+                assert_eq!(endpoint, "http://host.openshell.internal:53789/decide");
+                assert_eq!(timeout, std::time::Duration::from_secs(30));
+                assert_eq!(fallback, FallbackMode::Allow);
+            }
+            other => panic!("expected Interactive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_l7_config_interactive_defaults() {
+        let val = regorus::Value::from_json_str(
+            r#"{
+                "protocol": "rest",
+                "host": "api.example.com",
+                "port": 443,
+                "enforcement": { "mode": "interactive", "endpoint": "http://h:1/d" }
+            }"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        match config.enforcement {
+            EnforcementMode::Interactive {
+                timeout, fallback, ..
+            } => {
+                assert_eq!(timeout, INTERACTIVE_DEFAULT_TIMEOUT);
+                assert_eq!(fallback, FallbackMode::Deny);
+            }
+            other => panic!("expected Interactive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_l7_config_interactive_missing_endpoint_falls_closed() {
+        // Missing `endpoint` is a misconfiguration. Falling back to Audit
+        // would silently fail-open, so we degrade to Enforce instead — the
+        // operator notices, but the sandbox doesn't leak traffic.
+        let val = regorus::Value::from_json_str(
+            r#"{
+                "protocol": "rest",
+                "host": "api.example.com",
+                "port": 443,
+                "enforcement": { "mode": "interactive" }
+            }"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.enforcement, EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn parse_l7_config_interactive_bad_scheme_falls_closed() {
+        // C1 / SSRF: any endpoint scheme other than http:// or https:// must
+        // be rejected at parse time, falling closed to Enforce.  The supervisor
+        // process has direct TCP access; allowing file://, ftp://, gopher://
+        // etc. would be a server-side request forgery vector.
+        for bad_endpoint in &[
+            "file:///etc/passwd",
+            "ftp://evil.internal/",
+            "gopher://x/",
+            "data:text/plain,hello",
+            "//host.openshell.internal/decide", // protocol-relative — no scheme
+        ] {
+            let json = format!(
+                r#"{{
+                    "protocol": "rest",
+                    "host": "api.example.com",
+                    "port": 443,
+                    "enforcement": {{
+                        "mode": "interactive",
+                        "endpoint": "{bad_endpoint}"
+                    }}
+                }}"#
+            );
+            let val = regorus::Value::from_json_str(&json).unwrap();
+            let config = parse_l7_config(&val).unwrap();
+            assert_eq!(
+                config.enforcement,
+                EnforcementMode::Enforce,
+                "scheme in {bad_endpoint} must be rejected → Enforce"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_l7_config_interactive_timeout_zero_uses_default() {
+        // W3: timeout_seconds: 0 is nonsensical (immediate expiry → always fallback).
+        // It must be treated as absent and fall back to INTERACTIVE_DEFAULT_TIMEOUT.
+        let val = regorus::Value::from_json_str(
+            r#"{
+                "protocol": "rest",
+                "host": "api.example.com",
+                "port": 443,
+                "enforcement": {
+                    "mode": "interactive",
+                    "endpoint": "http://host.example.internal/decide",
+                    "timeout_seconds": 0
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(
+            config.enforcement,
+            EnforcementMode::Interactive {
+                endpoint: "http://host.example.internal/decide".into(),
+                timeout: INTERACTIVE_DEFAULT_TIMEOUT,
+                fallback: FallbackMode::Deny,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_l7_config_bare_string_back_compat() {
+        // Existing bare-string form must still parse — both keywords and an
+        // unknown string (which historically degraded to Audit).
+        let cases = [
+            ("enforce", EnforcementMode::Enforce),
+            ("audit", EnforcementMode::Audit),
+            ("nonsense", EnforcementMode::Audit),
+        ];
+        for (raw, expected) in cases {
+            let json = format!(
+                r#"{{"protocol":"rest","host":"x","port":80,"enforcement":"{raw}"}}"#
+            );
+            let val = regorus::Value::from_json_str(&json).unwrap();
+            let config = parse_l7_config(&val).unwrap();
+            assert_eq!(config.enforcement, expected, "case {raw}");
+        }
     }
 
     #[test]

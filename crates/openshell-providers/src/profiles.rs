@@ -188,6 +188,10 @@ pub struct L7AllowProfile {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct L7DenyRuleProfile {
+    /// Optional human-readable label (e.g. `name: gate-all`).
+    /// Preserved through round-trips but not evaluated by the policy engine.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub method: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -688,6 +692,7 @@ fn allow_from_proto(allow: &L7Allow) -> L7AllowProfile {
 
 fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
     L7DenyRule {
+        name: rule.name.clone(),
         method: rule.method.clone(),
         path: rule.path.clone(),
         command: rule.command.clone(),
@@ -704,6 +709,7 @@ fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
 
 fn deny_rule_from_proto(rule: &L7DenyRule) -> L7DenyRuleProfile {
     L7DenyRuleProfile {
+        name: rule.name.clone(),
         method: rule.method.clone(),
         path: rule.path.clone(),
         command: rule.command.clone(),

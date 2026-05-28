@@ -7,7 +7,7 @@
 //! raw passthrough so inspection and rewriting cannot expose response payloads.
 
 use crate::l7::relay::{L7EvalContext, evaluate_l7_request};
-use crate::l7::{EnforcementMode, L7RequestInfo};
+use crate::l7::{EnforcementMode, FallbackMode, L7RequestInfo};
 use crate::opa::TunnelPolicyEngine;
 use crate::secrets::SecretResolver;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
@@ -546,11 +546,23 @@ fn inspect_websocket_text_message(
         query_params: inspector.query_params.clone(),
         graphql: None,
     };
+    // TODO: this sync function cannot use block_in_place; carries the same OPA
+    // mutex starvation risk as relay.rs had before its async redesign.
     let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?;
-    let decision = match (allowed, inspector.enforcement) {
+    let decision = match (allowed, inspector.enforcement.clone()) {
         (true, _) => "allow",
         (false, EnforcementMode::Audit) => "audit",
         (false, EnforcementMode::Enforce) => "deny",
+        (false, EnforcementMode::Interactive { fallback, .. }) => {
+            // Per-message WebSocket inspection is sync; cannot await
+            // consult_interactive_endpoint here. Apply the configured fallback
+            // until a dedicated async WebSocket inspection phase lands.
+            // fallback-allow is distinct from audit-mode (policy violation logged but forwarded).
+            match fallback {
+                FallbackMode::Allow => "allow",
+                FallbackMode::Deny => "deny",
+            }
+        }
     };
     emit_websocket_l7_event(
         host,
@@ -561,7 +573,7 @@ fn inspect_websocket_text_message(
         &reason,
         None,
     );
-    if !allowed && inspector.enforcement == EnforcementMode::Enforce {
+    if decision == "deny" {
         return Err(miette!("websocket text message denied by policy"));
     }
     Ok(())
@@ -611,13 +623,25 @@ fn inspect_graphql_websocket_message(
             let (allowed, reason) = if let Some(reason) = parse_error_reason {
                 (false, reason)
             } else {
+                // TODO: same OPA mutex starvation risk as the text-message arm above.
                 evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?
             };
-            let decision = match (allowed, inspector.enforcement) {
+            let decision = match (allowed, inspector.enforcement.clone()) {
                 (_, _) if force_deny => "deny",
                 (true, _) => "allow",
                 (false, EnforcementMode::Audit) => "audit",
                 (false, EnforcementMode::Enforce) => "deny",
+                (false, EnforcementMode::Interactive { fallback, .. }) => {
+                    // Per-message WebSocket inspection is sync; cannot await
+                    // consult_interactive_endpoint here. Apply the configured
+                    // fallback until a dedicated async WebSocket inspection
+                    // phase lands.
+                    // fallback-allow is distinct from audit-mode (see text-message arm).
+                    match fallback {
+                        FallbackMode::Allow => "allow",
+                        FallbackMode::Deny => "deny",
+                    }
+                }
             };
             let reason = format!("graphql_ws_type={message_type} {reason}");
             emit_websocket_l7_event(
@@ -629,7 +653,7 @@ fn inspect_graphql_websocket_message(
                 &reason,
                 Some(&graphql),
             );
-            if (!allowed && inspector.enforcement == EnforcementMode::Enforce) || force_deny {
+            if decision == "deny" {
                 return Err(miette!("websocket GraphQL message denied by policy"));
             }
             Ok(())

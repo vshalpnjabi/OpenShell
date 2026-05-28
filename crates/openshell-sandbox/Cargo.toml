@@ -39,6 +39,12 @@ sha2 = { workspace = true }
 hex = "0.4"
 russh = "0.57"
 rand_core = "0.6"
+# Version pin: prevents fresh resolves from picking pkcs8 0.11.0-rc.12 / 0.11.0
+# final, which breaks rsa 0.10.0-rc.12 (pulled in by russh) on macOS.
+# rsa 0.10.0-rc.12 requires pkcs8 ^0.11.0-rc.8; rc.11 satisfies that and is
+# the version in Cargo.lock.  Declaring it here makes the constraint visible to
+# the resolver even when --locked is not passed.
+pkcs8 = { workspace = true }
 
 # OPA policy evaluation (no default features — full-opa pulls in opa-runtime which requires git in build)
 regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
@@ -50,10 +56,11 @@ rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
 webpki-roots = { workspace = true }
 
-# HTTP
+# HTTP (outbound — for interactive-enforcement decision client)
+reqwest = { workspace = true }
 bytes = { workspace = true }
 
-# UUID
+# UUID (workspace dep includes v4 feature)
 uuid = { workspace = true }
 
 # Encoding
@@ -94,6 +101,7 @@ tempfile = "3"
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
+wiremock = "0.6"
 
 [lints]
 workspace = true
