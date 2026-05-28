@@ -50,6 +50,31 @@ All ordinary agent egress is routed through the sandbox proxy. The proxy
 identifies the calling binary, checks trust-on-first-use binary identity, rejects
 unsafe internal destinations, and evaluates the active policy.
 
+### Enforcement Modes
+
+Each L7 endpoint in a network policy carries an `enforcement` field that controls
+what happens when OPA evaluates a request as a policy violation:
+
+| Mode | Behaviour |
+|---|---|
+| `audit` | Logs the violation and forwards the request. Safe for migration. |
+| `enforce` | Logs the violation and returns 403 immediately. |
+| `interactive` | Holds the connection open and POSTs a decision request to a configurable HTTP endpoint. Resolves allow or deny only after the endpoint responds. |
+
+`interactive` mode is intended for human-in-the-loop workflows where a host-side
+watcher notifies the user and waits for their decision before the in-flight
+request resolves. The connection holds open for up to `timeout_seconds` (default
+60). If the endpoint is unreachable, times out, or returns a non-conforming
+response, the configured `fallback` (default `deny`) applies.
+
+The decision endpoint receives a POST with a JSON body containing the request
+context (host, port, binary, pid, method, path, protocol, policy name, sandbox
+name) and responds with `{ "decision": "allow" | "deny", "reason": "..." }`.
+
+The proxy caps concurrent in-flight interactive decisions at 16 per supervisor
+instance. Requests beyond that cap immediately apply the fallback rather than
+queue indefinitely.
+
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
 

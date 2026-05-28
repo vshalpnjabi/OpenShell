@@ -225,7 +225,7 @@ Each segment has a fixed meaning:
 | `port` | Yes | Destination port, `1` through `65535`. |
 | `access` | No | Access preset for L7 endpoints: `read-only`, `read-write`, or `full`. Incremental updates expand presets into protocol-specific method/path rules for REST and WebSocket endpoints. |
 | `protocol` | No | L7 inspection mode: `rest`, `websocket`, or `sql`. `sql` is audit-only and not a recommended workflow today. |
-| `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. |
+| `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. The `interactive` object form (hold-and-ask) is only configurable via the YAML policy file — see the [policy schema reference](/reference/policy-schema#interactive-enforcement). |
 | `options` | No | Comma-separated endpoint options. Use `websocket-credential-rewrite` with `protocol: websocket` or REST compatibility endpoints that perform a WebSocket upgrade. Use `request-body-credential-rewrite` only with `protocol: rest`. |
 
 Examples:
