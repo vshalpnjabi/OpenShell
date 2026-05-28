@@ -66,6 +66,10 @@ pub enum FallbackMode {
 /// Default per-request timeout for an interactive enforcement decision.
 pub const INTERACTIVE_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Hard ceiling on `timeout_seconds` to prevent runaway task-leak under a
+/// misbehaving decision endpoint.
+pub const INTERACTIVE_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Enforcement mode for L7 policy decisions.
 ///
 /// `Interactive` carries a `String` so this enum is `Clone` rather than `Copy`.
@@ -299,11 +303,12 @@ fn parse_enforcement_value(val: Option<&regorus::Value>) -> EnforcementMode {
                 );
                 return EnforcementMode::Enforce;
             }
-            // timeout_seconds: 0 means "use default" (Duration::ZERO would
-            // cause every request to time out immediately).
+            // timeout_seconds: 0 → use default; values above the max ceiling
+            // are clamped to prevent proxy-task leak under a stalled endpoint.
             let timeout = get_object_u64(val, "timeout_seconds")
                 .filter(|&s| s > 0)
                 .map(std::time::Duration::from_secs)
+                .map(|t| t.min(INTERACTIVE_MAX_TIMEOUT))
                 .unwrap_or(INTERACTIVE_DEFAULT_TIMEOUT);
             let fallback = match get_object_str(val, "fallback").as_deref() {
                 Some("allow") => FallbackMode::Allow,
@@ -1447,6 +1452,34 @@ mod tests {
             EnforcementMode::Interactive {
                 endpoint: "http://host.example.internal/decide".into(),
                 timeout: INTERACTIVE_DEFAULT_TIMEOUT,
+                fallback: FallbackMode::Deny,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_l7_config_interactive_timeout_above_max_clamped() {
+        // A very large timeout_seconds must be silently clamped to
+        // INTERACTIVE_MAX_TIMEOUT to prevent proxy-task leaks.
+        let val = regorus::Value::from_json_str(
+            r#"{
+                "protocol": "rest",
+                "host": "example.com",
+                "port": 443,
+                "enforcement": {
+                    "mode": "interactive",
+                    "endpoint": "http://host.example.internal/decide",
+                    "timeout_seconds": 9999999
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(
+            config.enforcement,
+            EnforcementMode::Interactive {
+                endpoint: "http://host.example.internal/decide".into(),
+                timeout: INTERACTIVE_MAX_TIMEOUT,
                 fallback: FallbackMode::Deny,
             }
         );
