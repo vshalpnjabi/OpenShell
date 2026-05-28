@@ -64,8 +64,7 @@ pub enum FallbackMode {
 }
 
 /// Default per-request timeout for an interactive enforcement decision.
-pub const INTERACTIVE_DEFAULT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(60);
+pub const INTERACTIVE_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Enforcement mode for L7 policy decisions.
 ///
@@ -1463,9 +1462,8 @@ mod tests {
             ("nonsense", EnforcementMode::Audit),
         ];
         for (raw, expected) in cases {
-            let json = format!(
-                r#"{{"protocol":"rest","host":"x","port":80,"enforcement":"{raw}"}}"#
-            );
+            let json =
+                format!(r#"{{"protocol":"rest","host":"x","port":80,"enforcement":"{raw}"}}"#);
             let val = regorus::Value::from_json_str(&json).unwrap();
             let config = parse_l7_config(&val).unwrap();
             assert_eq!(config.enforcement, expected, "case {raw}");

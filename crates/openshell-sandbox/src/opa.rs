@@ -3173,8 +3173,16 @@ process:
         let allow = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
-        assert_eq!(deny,  regorus::Value::from(true),  "deny_request must be true for POST /v1/messages");
-        assert_eq!(allow, regorus::Value::from(false), "allow_request must be false for POST /v1/messages");
+        assert_eq!(
+            deny,
+            regorus::Value::from(true),
+            "deny_request must be true for POST /v1/messages"
+        );
+        assert_eq!(
+            allow,
+            regorus::Value::from(false),
+            "allow_request must be false for POST /v1/messages"
+        );
     }
 
     // ========================================================================

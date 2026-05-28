@@ -732,7 +732,8 @@ where
         }
 
         // block_in_place: OPA eval holds a synchronous Mutex; see relay_with_route_selection.
-        let (allowed, reason) = tokio::task::block_in_place(|| evaluate_l7_request(engine, ctx, &request_info))?;
+        let (allowed, reason) =
+            tokio::task::block_in_place(|| evaluate_l7_request(engine, ctx, &request_info))?;
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());

@@ -1769,7 +1769,10 @@ process:
         // Name survives a round-trip
         let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
         let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
-        assert_eq!(proto2.network_policies["gate"].endpoints[0].deny_rules[0].name, "gate-all");
+        assert_eq!(
+            proto2.network_policies["gate"].endpoints[0].deny_rules[0].name,
+            "gate-all"
+        );
     }
 
     #[test]
@@ -1972,7 +1975,10 @@ network_policies:
       - path: /usr/bin/curl
 ";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
-        assert_eq!(proto.network_policies["test"].endpoints[0].enforcement, "enforce");
+        assert_eq!(
+            proto.network_policies["test"].endpoints[0].enforcement,
+            "enforce"
+        );
     }
 
     #[test]
@@ -1995,7 +2001,10 @@ network_policies:
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         // Proto stores the object form as a JSON-encoded string.
         let stored = &proto1.network_policies["test"].endpoints[0].enforcement;
-        assert!(stored.starts_with('{'), "expected JSON-encoded form, got {stored:?}");
+        assert!(
+            stored.starts_with('{'),
+            "expected JSON-encoded form, got {stored:?}"
+        );
         assert!(stored.contains("\"mode\":\"interactive\""));
         assert!(stored.contains("\"endpoint\":\"http://host.openshell.internal:53789/decide\""));
         assert!(stored.contains("\"timeout_seconds\":60"));
@@ -2009,7 +2018,10 @@ network_policies:
             proto2.network_policies["test"].endpoints[0].enforcement
         );
         // YAML output uses the human-friendly map form, not JSON-in-a-string.
-        assert!(yaml_out.contains("mode: interactive"), "yaml_out:\n{yaml_out}");
+        assert!(
+            yaml_out.contains("mode: interactive"),
+            "yaml_out:\n{yaml_out}"
+        );
         assert!(yaml_out.contains("endpoint: http://host.openshell.internal:53789/decide"));
     }
 

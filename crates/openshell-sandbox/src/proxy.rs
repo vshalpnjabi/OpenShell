@@ -3175,10 +3175,7 @@ async fn handle_forward_proxy(
                     sandbox_name: &crate::ocsf_ctx().sandbox_name,
                 };
                 match crate::l7::interactive::consult_interactive_endpoint(
-                    endpoint,
-                    *timeout,
-                    *fallback,
-                    &ctx,
+                    endpoint, *timeout, *fallback, &ctx,
                 )
                 .await
                 {

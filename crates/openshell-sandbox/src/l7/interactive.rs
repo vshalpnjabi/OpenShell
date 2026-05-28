@@ -244,13 +244,10 @@ pub(crate) async fn consult_interactive_endpoint(
             bytes.len(),
             MAX_RESPONSE_BYTES
         );
-        let parsed = serde_json::from_slice::<DecisionResponse>(&bytes)
-            .map_err(anyhow::Error::from)?;
+        let parsed =
+            serde_json::from_slice::<DecisionResponse>(&bytes).map_err(anyhow::Error::from)?;
 
-        tracing::debug!(
-            endpoint,
-            "interactive-enforcement: [E] body parsed"
-        );
+        tracing::debug!(endpoint, "interactive-enforcement: [E] body parsed");
 
         Ok::<_, anyhow::Error>(parsed)
     })
@@ -283,7 +280,7 @@ pub(crate) async fn consult_interactive_endpoint(
     let decision_lower = parsed.decision.trim().to_ascii_lowercase();
     match decision_lower.as_str() {
         "allow" => {
-            tracing::info!(
+            tracing::debug!(
                 endpoint,
                 reason = %sanitize_reason(&parsed.reason),
                 "interactive-enforcement: allowed"
@@ -291,7 +288,7 @@ pub(crate) async fn consult_interactive_endpoint(
             InteractiveDecision::Allow
         }
         "deny" => {
-            tracing::info!(
+            tracing::debug!(
                 endpoint,
                 reason = %sanitize_reason(&parsed.reason),
                 "interactive-enforcement: denied"
@@ -396,8 +393,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/decide"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"decision":"allow"})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"decision":"allow"})),
             )
             .mount(&server)
             .await;
@@ -463,8 +459,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/decide"))
             .respond_with(
-                ResponseTemplate::new(500)
-                    .set_body_json(serde_json::json!({"decision":"allow"})),
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({"decision":"allow"})),
             )
             .mount(&server)
             .await;
@@ -529,8 +524,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/decide"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"decision":"unknown"})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"decision":"unknown"})),
             )
             .mount(&server)
             .await;
@@ -568,8 +562,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/decide"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"decision":"deny"})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"decision":"deny"})),
             )
             .mount(&server)
             .await;
@@ -607,7 +600,10 @@ mod tests {
         assert_eq!(body["protocol"], "rest", "protocol");
         assert_eq!(body["policy_name"], "my_policy", "policy_name");
         assert_eq!(body["sandbox_name"], "my-sandbox", "sandbox_name");
-        assert!(body["request_id"].is_string(), "request_id must be a string");
+        assert!(
+            body["request_id"].is_string(),
+            "request_id must be a string"
+        );
         assert!(
             !body["request_id"].as_str().unwrap_or("").is_empty(),
             "request_id must not be empty"
@@ -649,8 +645,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/decide"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"decision":"deny"})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"decision":"deny"})),
             )
             .mount(&server)
             .await;
