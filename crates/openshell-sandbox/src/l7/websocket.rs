@@ -549,11 +549,11 @@ fn inspect_websocket_text_message(
     // TODO: this sync function cannot use block_in_place; carries the same OPA
     // mutex starvation risk as relay.rs had before its async redesign.
     let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?;
-    let decision = match (allowed, inspector.enforcement.clone()) {
+    let decision = match (allowed, &inspector.enforcement) {
         (true, _) => "allow",
-        (false, EnforcementMode::Audit) => "audit",
-        (false, EnforcementMode::Enforce) => "deny",
-        (false, EnforcementMode::Interactive { fallback, .. }) => {
+        (false, &EnforcementMode::Audit) => "audit",
+        (false, &EnforcementMode::Enforce) => "deny",
+        (false, &EnforcementMode::Interactive { fallback, .. }) => {
             // Per-message WebSocket inspection is sync; cannot await
             // consult_interactive_endpoint here. Apply the configured fallback
             // until a dedicated async WebSocket inspection phase lands.
@@ -626,12 +626,12 @@ fn inspect_graphql_websocket_message(
                 // TODO: same OPA mutex starvation risk as the text-message arm above.
                 evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?
             };
-            let decision = match (allowed, inspector.enforcement.clone()) {
+            let decision = match (allowed, &inspector.enforcement) {
                 (_, _) if force_deny => "deny",
                 (true, _) => "allow",
-                (false, EnforcementMode::Audit) => "audit",
-                (false, EnforcementMode::Enforce) => "deny",
-                (false, EnforcementMode::Interactive { fallback, .. }) => {
+                (false, &EnforcementMode::Audit) => "audit",
+                (false, &EnforcementMode::Enforce) => "deny",
+                (false, &EnforcementMode::Interactive { fallback, .. }) => {
                     // Per-message WebSocket inspection is sync; cannot await
                     // consult_interactive_endpoint here. Apply the configured
                     // fallback until a dedicated async WebSocket inspection

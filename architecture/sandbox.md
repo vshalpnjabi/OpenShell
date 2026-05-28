@@ -55,7 +55,7 @@ unsafe internal destinations, and evaluates the active policy.
 Each L7 endpoint in a network policy carries an `enforcement` field that controls
 what happens when OPA evaluates a request as a policy violation:
 
-| Mode | Behaviour |
+| Mode | Behavior |
 |---|---|
 | `audit` | Logs the violation and forwards the request. Safe for migration. |
 | `enforce` | Logs the violation and returns 403 immediately. |
