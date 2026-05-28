@@ -1513,6 +1513,9 @@ network_policies:
         assert!(reason.contains("WEBSOCKET_TEXT /ws not permitted"));
     }
 
+    // The remaining tests use multi_thread because relay functions call
+    // tokio::task::block_in_place (wrapping the synchronous OPA eval), which
+    // panics on the default single-thread test runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn route_selected_websocket_upgrade_rejects_invalid_accept_without_forwarding_101() {
         let data = r#"

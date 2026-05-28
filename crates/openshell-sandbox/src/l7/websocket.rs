@@ -558,6 +558,13 @@ fn inspect_websocket_text_message(
             // consult_interactive_endpoint here. Apply the configured fallback
             // until a dedicated async WebSocket inspection phase lands.
             // fallback-allow is distinct from audit-mode (policy violation logged but forwarded).
+            tracing::warn!(
+                host,
+                port,
+                "interactive-enforcement: WebSocket per-message inspection \
+                 cannot consult decision endpoint (sync context); \
+                 applying fallback"
+            );
             match fallback {
                 FallbackMode::Allow => "allow",
                 FallbackMode::Deny => "deny",
@@ -637,6 +644,13 @@ fn inspect_graphql_websocket_message(
                     // fallback until a dedicated async WebSocket inspection
                     // phase lands.
                     // fallback-allow is distinct from audit-mode (see text-message arm).
+                    tracing::warn!(
+                        host,
+                        port,
+                        "interactive-enforcement: WebSocket per-message inspection \
+                         cannot consult decision endpoint (sync context); \
+                         applying fallback"
+                    );
                     match fallback {
                         FallbackMode::Allow => "allow",
                         FallbackMode::Deny => "deny",
