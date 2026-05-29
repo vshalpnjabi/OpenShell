@@ -568,6 +568,9 @@ mod tests {
             libc::waitpid(child_pid, std::ptr::null_mut(), 0);
         }
 
+        // The parent (this test process) and the forked child both hold the same
+        // socket inode with different identities, so the audit row must surface
+        // the ambiguity rather than silently attributing to one PID.
         assert_eq!(binary, "ambiguous");
         assert!(pid.contains(&std::process::id().to_string()));
         assert!(pid.contains(&child_pid.to_string()));

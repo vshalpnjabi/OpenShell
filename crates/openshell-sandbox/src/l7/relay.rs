@@ -31,6 +31,11 @@ pub struct L7EvalContext {
     pub policy_name: String,
     /// Binary path (for cross-layer Rego evaluation).
     pub binary_path: String,
+    /// PID that owned the socket at L4 CONNECT time, as resolved for the
+    /// network decision. Carried so interactive enforcement can report the
+    /// same PID the allow/deny path bound to. `None` when L4 could not resolve
+    /// a single owner.
+    pub binary_pid: Option<u32>,
     /// Ancestor paths.
     pub ancestors: Vec<String>,
     /// Cmdline paths.
@@ -310,18 +315,59 @@ where
         let (allowed, reason) = if let Some(reason) = parse_error_reason {
             (false, reason)
         } else {
-            evaluate_l7_request(&engine, ctx, &request_info)?
+            // block_in_place: OPA eval holds a synchronous Mutex on the worker
+            // thread; signal tokio to activate spare threads so I/O can proceed.
+            tokio::task::block_in_place(|| evaluate_l7_request(&engine, ctx, &request_info))?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
 
-        let decision_str = match (allowed, config.enforcement) {
+        let protocol_str = match config.protocol {
+            L7Protocol::Rest => "rest",
+            L7Protocol::Websocket => "websocket",
+            L7Protocol::Graphql => "graphql",
+            L7Protocol::Sql => "sql",
+        };
+        let decision_str = match (allowed, &config.enforcement) {
             (_, _) if force_deny => "deny",
             (true, _) => "allow",
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
+            (
+                false,
+                EnforcementMode::Interactive {
+                    endpoint,
+                    timeout,
+                    fallback,
+                    secret,
+                },
+            ) => {
+                let interactive_ctx = crate::l7::interactive::InteractiveContext {
+                    host: &ctx.host,
+                    port: ctx.port,
+                    binary: &ctx.binary_path,
+                    pid: ctx.binary_pid,
+                    method: &request_info.action,
+                    path: &redacted_target,
+                    protocol: protocol_str,
+                    policy_name: &ctx.policy_name,
+                    sandbox_name: &crate::ocsf_ctx().sandbox_name,
+                };
+                match crate::l7::interactive::consult_interactive_endpoint(
+                    endpoint,
+                    *timeout,
+                    *fallback,
+                    secret.as_deref(),
+                    &interactive_ctx,
+                )
+                .await
+                {
+                    crate::l7::interactive::InteractiveDecision::Allow => "allow",
+                    crate::l7::interactive::InteractiveDecision::Deny => "deny",
+                }
+            }
         };
         let engine_type = match config.protocol {
             L7Protocol::Graphql => "l7-graphql",
@@ -340,7 +386,7 @@ where
 
         let _ = &eval_target;
 
-        if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+        if decision_str != "deny" {
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
@@ -577,7 +623,7 @@ pub(crate) fn upgrade_options<'a>(
         },
         engine,
         ctx: engine.map(|_| ctx),
-        enforcement: config.enforcement,
+        enforcement: config.enforcement.clone(),
         target: target.to_string(),
         query_params: query_params.clone(),
         policy_name: ctx.policy_name.clone(),
@@ -692,8 +738,9 @@ where
             return Ok(());
         }
 
-        // Evaluate L7 policy via Rego (using redacted target)
-        let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
+        // block_in_place: OPA eval holds a synchronous Mutex; see relay_with_route_selection.
+        let (allowed, reason) =
+            tokio::task::block_in_place(|| evaluate_l7_request(engine, ctx, &request_info))?;
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -712,11 +759,58 @@ where
                 .any(|l| l.to_ascii_lowercase().starts_with("upgrade:"))
         };
 
-        let decision_str = match (allowed, config.enforcement, is_upgrade_request) {
+        let protocol_str = match config.protocol {
+            L7Protocol::Rest => "rest",
+            L7Protocol::Websocket => "websocket",
+            L7Protocol::Graphql => "graphql",
+            L7Protocol::Sql => "sql",
+        };
+        let decision_str = match (allowed, &config.enforcement, is_upgrade_request) {
             (true, _, true) => "allow_upgrade",
             (true, _, false) => "allow",
             (false, EnforcementMode::Audit, _) => "audit",
             (false, EnforcementMode::Enforce, _) => "deny",
+            (
+                false,
+                EnforcementMode::Interactive {
+                    endpoint,
+                    timeout,
+                    fallback,
+                    secret,
+                },
+                _,
+            ) => {
+                let interactive_ctx = crate::l7::interactive::InteractiveContext {
+                    host: &ctx.host,
+                    port: ctx.port,
+                    binary: &ctx.binary_path,
+                    pid: ctx.binary_pid,
+                    method: &request_info.action,
+                    path: &redacted_target,
+                    protocol: protocol_str,
+                    policy_name: &ctx.policy_name,
+                    sandbox_name: &crate::ocsf_ctx().sandbox_name,
+                };
+                match crate::l7::interactive::consult_interactive_endpoint(
+                    endpoint,
+                    *timeout,
+                    *fallback,
+                    secret.as_deref(),
+                    &interactive_ctx,
+                )
+                .await
+                {
+                    // "allow" is correct even when is_upgrade_request is true.
+                    // "allow_upgrade" vs "allow" is a logging distinction only —
+                    // both pass the `decision_str != "deny"` forwarding gate below.
+                    // Interactive only fires when allowed==false, so any upgrade
+                    // that reaches here was policy-denied and held for a human
+                    // decision; the OCSF event will show "allow" rather than
+                    // "allow_upgrade", which is an accepted observability gap.
+                    crate::l7::interactive::InteractiveDecision::Allow => "allow",
+                    crate::l7::interactive::InteractiveDecision::Deny => "deny",
+                }
+            }
         };
 
         // Log every L7 decision as an OCSF HTTP Activity event.
@@ -757,7 +851,7 @@ where
         // Store the resolved target for the deny response redaction
         let _ = &eval_target;
 
-        if allowed || config.enforcement == EnforcementMode::Audit {
+        if decision_str != "deny" {
             // Forward request to upstream and relay response
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
@@ -939,18 +1033,57 @@ where
         let (allowed, reason) = if let Some(reason) = parse_error_reason {
             (false, reason)
         } else {
-            evaluate_l7_request(engine, ctx, &request_info)?
+            // block_in_place: OPA eval holds a synchronous Mutex; see relay_with_route_selection.
+            tokio::task::block_in_place(|| evaluate_l7_request(engine, ctx, &request_info))?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
 
-        let decision_str = match (allowed, config.enforcement) {
+        let decision_str = match (allowed, &config.enforcement) {
             (_, _) if force_deny => "deny",
             (true, _) => "allow",
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
+            (
+                false,
+                EnforcementMode::Interactive {
+                    endpoint,
+                    timeout,
+                    fallback,
+                    secret,
+                },
+            ) => {
+                let interactive_ctx = crate::l7::interactive::InteractiveContext {
+                    host: &ctx.host,
+                    port: ctx.port,
+                    binary: &ctx.binary_path,
+                    pid: ctx.binary_pid,
+                    method: &request_info.action,
+                    path: &redacted_target,
+                    // S1: "graphql" is hardcoded here (not derived from
+                    // config.protocol) because relay_graphql is only ever called
+                    // for GraphQL traffic.  relay_with_route_selection computes
+                    // protocol_str from config.protocol because it handles REST,
+                    // WebSocket, and GraphQL in a unified path.
+                    protocol: "graphql",
+                    policy_name: &ctx.policy_name,
+                    sandbox_name: &crate::ocsf_ctx().sandbox_name,
+                };
+                match crate::l7::interactive::consult_interactive_endpoint(
+                    endpoint,
+                    *timeout,
+                    *fallback,
+                    secret.as_deref(),
+                    &interactive_ctx,
+                )
+                .await
+                {
+                    crate::l7::interactive::InteractiveDecision::Allow => "allow",
+                    crate::l7::interactive::InteractiveDecision::Deny => "deny",
+                }
+            }
         };
 
         {
@@ -989,7 +1122,7 @@ where
 
         let _ = &eval_target;
 
-        if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+        if decision_str != "deny" {
             let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
                 &req,
                 client,
@@ -1368,6 +1501,7 @@ network_policies:
             port: 443,
             policy_name: "ws_api".into(),
             binary_path: "/usr/bin/node".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -1385,7 +1519,10 @@ network_policies:
         assert!(reason.contains("WEBSOCKET_TEXT /ws not permitted"));
     }
 
-    #[tokio::test]
+    // The remaining tests use multi_thread because relay functions call
+    // tokio::task::block_in_place (wrapping the synchronous OPA eval), which
+    // panics on the default single-thread test runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn route_selected_websocket_upgrade_rejects_invalid_accept_without_forwarding_101() {
         let data = r#"
 network_policies:
@@ -1423,6 +1560,7 @@ network_policies:
             port: 443,
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -1481,7 +1619,7 @@ network_policies:
         assert_eq!(n, 0, "invalid response must not forward 101 headers");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn route_selected_websocket_rewrites_text_credentials_after_upgrade() {
         let data = r#"
 network_policies:
@@ -1527,6 +1665,7 @@ network_policies:
             port: 443,
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
@@ -1597,7 +1736,7 @@ network_policies:
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn route_selected_graphql_websocket_rewrites_connection_init_credentials_after_upgrade() {
         let data = r#"
 network_policies:
@@ -1644,6 +1783,7 @@ network_policies:
             port: 443,
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
@@ -1761,7 +1901,7 @@ network_policies:
         Ok((masked, String::from_utf8(payload).expect("text payload")))
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn l7_relay_closes_keep_alive_tunnel_after_policy_generation_change() {
         let initial_data = r#"
 network_policies:
@@ -1814,6 +1954,7 @@ network_policies:
             port: 8080,
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -1889,7 +2030,7 @@ network_policies:
         assert_eq!(n, 0, "stale request must not be forwarded upstream");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn passthrough_relay_closes_keep_alive_tunnel_after_policy_generation_change() {
         let policy_data = "network_policies: {}\n";
         let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
@@ -1901,6 +2042,7 @@ network_policies:
             port: 8080,
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,

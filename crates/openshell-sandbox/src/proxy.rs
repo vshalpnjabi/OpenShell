@@ -834,6 +834,7 @@ async fn handle_tcp_connection(
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        binary_pid: decision.binary_pid,
         ancestors: decision
             .ancestors
             .iter()
@@ -2912,6 +2913,7 @@ async fn handle_forward_proxy(
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        binary_pid: decision.binary_pid,
         ancestors: decision
             .ancestors
             .iter()
@@ -3112,27 +3114,85 @@ async fn handle_forward_proxy(
         let force_deny = parse_error_reason.is_some();
         let (allowed, reason) = parse_error_reason.map_or_else(
             || {
-                crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
-                    .unwrap_or_else(|e| {
-                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::Low)
-                            .status(StatusId::Failure)
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .message(format!("L7 eval failed, denying request: {e}"))
-                            .build();
-                        ocsf_emit!(event);
-                        (false, format!("L7 evaluation error: {e}"))
-                    })
+                // block_in_place: OPA eval holds a synchronous Mutex; signal tokio
+                // to activate spare threads so concurrent I/O can proceed.
+                tokio::task::block_in_place(|| {
+                    crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
+                        .unwrap_or_else(|e| {
+                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                                .message(format!("L7 eval failed, denying request: {e}"))
+                                .build();
+                            ocsf_emit!(event);
+                            (false, format!("L7 evaluation error: {e}"))
+                        })
+                })
             },
             |reason| (false, reason),
         );
 
-        let decision_str = match (allowed, l7_config.config.enforcement) {
+        // Used by the Interactive arm below to populate InteractiveContext.
+        // Computed here (before borrowing `enforcement`) because L7Protocol is Copy.
+        let protocol_str = match l7_config.config.protocol {
+            crate::l7::L7Protocol::Rest => "rest",
+            crate::l7::L7Protocol::Websocket => "websocket",
+            crate::l7::L7Protocol::Graphql => "graphql",
+            crate::l7::L7Protocol::Sql => "sql",
+        };
+        let decision_str = match (allowed, &l7_config.config.enforcement) {
             (_, _) if force_deny => "deny",
             (true, _) => "allow",
             (false, crate::l7::EnforcementMode::Audit) => "audit",
             (false, crate::l7::EnforcementMode::Enforce) => "deny",
+            (
+                false,
+                crate::l7::EnforcementMode::Interactive {
+                    endpoint,
+                    timeout,
+                    fallback,
+                    secret,
+                },
+            ) => {
+                // Redact credential query-params; when no resolver is present,
+                // strip the query string entirely to avoid leaking raw credentials.
+                let interactive_path = match secret_resolver.as_deref() {
+                    Some(resolver) => {
+                        crate::secrets::rewrite_target_for_eval(&upstream_target, resolver)
+                            .map(|r| r.redacted)
+                            .unwrap_or_else(|_| upstream_target.clone())
+                    }
+                    None => upstream_target
+                        .split_once('?')
+                        .map(|(path, _)| path.to_string())
+                        .unwrap_or_else(|| upstream_target.clone()),
+                };
+                let ctx = crate::l7::interactive::InteractiveContext {
+                    host: &host_lc,
+                    port,
+                    binary: &binary_str,
+                    pid: decision.binary_pid,
+                    method,
+                    path: &interactive_path,
+                    protocol: protocol_str,
+                    policy_name: &l7_ctx.policy_name,
+                    sandbox_name: &crate::ocsf_ctx().sandbox_name,
+                };
+                match crate::l7::interactive::consult_interactive_endpoint(
+                    endpoint,
+                    *timeout,
+                    *fallback,
+                    secret.as_deref(),
+                    &ctx,
+                )
+                .await
+                {
+                    crate::l7::interactive::InteractiveDecision::Allow => "allow",
+                    crate::l7::interactive::InteractiveDecision::Deny => "deny",
+                }
+            }
         };
 
         {
@@ -3182,8 +3242,10 @@ async fn handle_forward_proxy(
             ocsf_emit!(event);
         }
 
-        let effectively_denied = force_deny
-            || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
+        // `decision_str` already accounts for force_deny, enforcement mode, and
+        // (for Interactive) the endpoint's response.  Deriving from it avoids a
+        // second pattern-match that would always agree with the first.
+        let effectively_denied = decision_str == "deny";
 
         if effectively_denied {
             emit_denial_simple(
@@ -3825,6 +3887,7 @@ mod tests {
             port,
             policy_name: policy_name.to_string(),
             binary_path: "/usr/bin/node".to_string(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -3990,6 +4053,7 @@ mod tests {
             port: 80,
             policy_name: "ws_api".to_string(),
             binary_path: "/usr/bin/node".to_string(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver,
@@ -4030,6 +4094,7 @@ mod tests {
             port: 80,
             policy_name: "rest_api".to_string(),
             binary_path: "/usr/bin/node".to_string(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,

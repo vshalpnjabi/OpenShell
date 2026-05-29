@@ -219,6 +219,7 @@ fn group_deny_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7De
             .entry((parsed.host, parsed.port))
             .or_insert_with(Vec::new)
             .push(L7DenyRule {
+                name: String::new(),
                 method: parsed.method,
                 path: parsed.path,
                 command: String::new(),

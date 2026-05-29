@@ -958,7 +958,18 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         ep["tls"] = e.tls.clone().into();
                     }
                     if !e.enforcement.is_empty() {
-                        ep["enforcement"] = e.enforcement.clone().into();
+                        // Bare strings ("audit"/"enforce") pass through as
+                        // JSON strings. The interactive enforcement form is
+                        // stored in the proto as a JSON-encoded object (see
+                        // openshell-policy::enforcement_def_to_proto_string);
+                        // decode it back into a JSON object so the L7 config
+                        // parser can read the structured fields.
+                        ep["enforcement"] = if e.enforcement.trim_start().starts_with('{') {
+                            serde_json::from_str::<serde_json::Value>(&e.enforcement)
+                                .unwrap_or_else(|_| e.enforcement.clone().into())
+                        } else {
+                            e.enforcement.clone().into()
+                        };
                     }
                     if !e.access.is_empty() {
                         ep["access"] = e.access.clone().into();
@@ -3086,6 +3097,91 @@ process:
             val,
             regorus::Value::from(true),
             "deny without matching query key should allow"
+        );
+    }
+
+    // ========================================================================
+    // Diagnostic: deny_rules with universal method:"*" path:"**" + access:full
+    // Regression for L7_DENY_RULES_NOT_FIRING bug report.
+    // ========================================================================
+
+    const DENY_RULES_UNIVERSAL_DATA: &str = r#"
+version: 1
+network_policies:
+  gate:
+    name: gate
+    endpoints:
+      - host: "*.example.com"
+        port: 443
+        protocol: rest
+        access: full
+        deny_rules:
+          - method: "*"
+            path: "**"
+    binaries:
+      - path: "**"
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+
+    fn deny_rules_universal_engine() -> OpaEngine {
+        OpaEngine::from_strings(TEST_POLICY, DENY_RULES_UNIVERSAL_DATA)
+            .expect("Failed to load deny_rules universal test data")
+    }
+
+    #[test]
+    fn deny_rules_force_deny_request_with_access_full() {
+        let engine = deny_rules_universal_engine();
+        let input = l7_input("www.example.com", 443, "GET", "/");
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let deny = eng
+            .eval_rule("data.openshell.sandbox.deny_request".into())
+            .unwrap();
+        let allow = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            deny,
+            regorus::Value::from(true),
+            "deny_request must be true: deny_rules:[{{method:*, path:**}}] should match every request"
+        );
+        assert_eq!(
+            allow,
+            regorus::Value::from(false),
+            "allow_request must be false when deny_request is true"
+        );
+    }
+
+    #[test]
+    fn deny_rules_force_deny_request_post_deep_path() {
+        // Also test with a non-root path and POST to rule out path canonicalization issues
+        let engine = deny_rules_universal_engine();
+        let input = l7_input("api.example.com", 443, "POST", "/v1/messages");
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let deny = eng
+            .eval_rule("data.openshell.sandbox.deny_request".into())
+            .unwrap();
+        let allow = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            deny,
+            regorus::Value::from(true),
+            "deny_request must be true for POST /v1/messages"
+        );
+        assert_eq!(
+            allow,
+            regorus::Value::from(false),
+            "allow_request must be false for POST /v1/messages"
         );
     }
 

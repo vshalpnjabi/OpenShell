@@ -157,7 +157,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
 | `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, or `graphql` for GraphQL-over-HTTP operation inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Omit for TCP passthrough. |
 | `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
-| `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
+| `enforcement` | string or object | No | Controls what happens when a request violates policy. `enforce` blocks the request and returns 403. `audit` logs the violation but allows traffic through. The `interactive` object form holds the connection open and consults an external HTTP endpoint before deciding. See [Interactive Enforcement](#interactive-enforcement) below. |
 | `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
 | `rules` | list of rule objects | No | Fine-grained protocol-specific allow rules. Mutually exclusive with `access`. |
 | `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
@@ -170,6 +170,63 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
+
+#### Interactive Enforcement
+
+When `enforcement` is set to an object with `mode: interactive`, the proxy holds
+the connection open and POSTs a decision request to a host-side HTTP endpoint
+before deciding whether to allow or deny the request.
+
+```yaml
+enforcement:
+  mode: interactive
+  endpoint: http://host.openshell.internal:53789/decide
+  timeout_seconds: 60   # optional — default 60; 0 is treated as absent
+  fallback: deny        # optional — default deny
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `mode` | Yes | Must be `interactive`. |
+| `endpoint` | Yes | HTTP or HTTPS URL the proxy will POST the decision request to. Must use an `http://` or `https://` scheme. |
+| `timeout_seconds` | No | How long to wait for a decision before applying `fallback`. Defaults to 60. Setting to 0 uses the default. |
+| `fallback` | No | What to do if the endpoint is unreachable, times out, or returns a non-conforming response. `deny` (default) or `allow`. |
+
+The proxy sends a POST with `Content-Type: application/json`:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "<uuid-v4>",
+  "host": "api.example.com",
+  "port": 443,
+  "binary": "/usr/local/bin/claude",
+  "pid": 1244,
+  "method": "POST",
+  "path": "/v1/messages",
+  "protocol": "rest",
+  "policy_name": "my-policy",
+  "sandbox_name": "my-sandbox"
+}
+```
+
+The endpoint must respond with:
+
+```json
+{ "decision": "allow", "reason": "user approved" }
+```
+
+or
+
+```json
+{ "decision": "deny", "reason": "user rejected" }
+```
+
+Any non-2xx response, malformed JSON, or missing `decision` field triggers `fallback`.
+The `reason` field is optional and is included in the OCSF audit log if present.
+
+The proxy limits concurrent in-flight interactive decisions to 16 per supervisor.
+Requests beyond that cap immediately apply `fallback` rather than queue.
 
 #### Access Levels
 

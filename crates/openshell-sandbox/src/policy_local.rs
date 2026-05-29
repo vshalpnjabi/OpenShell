@@ -1067,6 +1067,7 @@ fn network_endpoint_from_json(
         .deny_rules
         .into_iter()
         .map(|rule| L7DenyRule {
+            name: String::new(),
             method: rule.method,
             path: rule.path,
             command: rule.command,

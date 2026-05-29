@@ -104,8 +104,12 @@ struct NetworkEndpointDef {
     protocol: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     tls: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    enforcement: String,
+    /// Enforcement mode. Accepts either a bare string (`audit` / `enforce`)
+    /// for backward compatibility, or an object form for `interactive` mode
+    /// (see `InteractiveEnforcementDef`). Absent → falls through to the
+    /// engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enforcement: Option<EnforcementDef>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     access: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -147,6 +151,93 @@ fn is_zero(v: &u16) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+/// YAML representation of the endpoint `enforcement` field.
+///
+/// Two shapes are accepted:
+///
+/// ```yaml
+/// enforcement: enforce          # bare-string form (back-compat)
+/// ```
+///
+/// ```yaml
+/// enforcement:                  # object form (interactive mode)
+///   mode: interactive
+///   endpoint: http://host.openshell.internal:53789/decide
+///   timeout_seconds: 60
+///   fallback: deny
+/// ```
+///
+/// The proto layer represents `enforcement` as a single string. The bare-string
+/// form is stored verbatim; the object form is round-tripped via a canonical
+/// JSON encoding (see `enforcement_def_to_proto_string` /
+/// `enforcement_def_from_proto_string`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum EnforcementDef {
+    Bare(String),
+    Object(InteractiveEnforcementDef),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct InteractiveEnforcementDef {
+    /// Required discriminant. Currently only `"interactive"` is meaningful;
+    /// other values round-trip but are ignored by the proxy.
+    mode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    endpoint: String,
+    /// Per-request decision timeout. `0` means "use the engine default" and is
+    /// omitted from serialized YAML.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    timeout_seconds: u32,
+    /// `"allow"` or `"deny"`. Empty means "use the engine default" (deny).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    fallback: String,
+    /// Optional bearer token sent as `Authorization: Bearer <secret>` on every
+    /// POST. Absent → no auth header and a warning is emitted at startup.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    secret: String,
+}
+
+/// Serialize an `EnforcementDef` for storage in the proto's `string enforcement`
+/// field. The bare-string form is passed through; the object form is encoded
+/// as canonical JSON so the round-trip and the OPA-data emission can recover
+/// the structure later.
+fn enforcement_def_to_proto_string(def: &EnforcementDef) -> String {
+    match def {
+        EnforcementDef::Bare(s) => s.clone(),
+        EnforcementDef::Object(obj) => {
+            // Fallback to "enforce" (not "interactive") so serialization
+            // failure degrades fail-closed. In practice serde_json::to_string
+            // never fails for this struct.
+            serde_json::to_string(obj).unwrap_or_else(|_| "enforce".to_string())
+        }
+    }
+}
+
+/// Reverse of `enforcement_def_to_proto_string`. An empty proto string
+/// becomes `None`; a JSON-shaped string is parsed back into the object form;
+/// anything else is treated as a bare keyword.
+fn enforcement_def_from_proto_string(raw: &str) -> Option<EnforcementDef> {
+    if raw.is_empty() {
+        return None;
+    }
+    let trimmed = raw.trim_start();
+    if trimmed.starts_with('{') {
+        if let Ok(obj) = serde_json::from_str::<InteractiveEnforcementDef>(raw) {
+            return Some(EnforcementDef::Object(obj));
+        }
+        // Malformed JSON — warn so the operator knows the enforcement config
+        // was silently downgraded to bare-string treatment.
+        tracing::warn!(
+            raw,
+            "interactive-enforcement: enforcement proto string starts with '{{' \
+             but failed JSON parse; treating as bare string — check policy config"
+        );
+    }
+    Some(EnforcementDef::Bare(raw.to_string()))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -202,6 +293,10 @@ struct QueryAnyDef {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct L7DenyRuleDef {
+    /// Optional human-readable label for the rule (e.g. `name: gate-all`).
+    /// Preserved through round-trips but not evaluated by the policy engine.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     method: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -263,7 +358,11 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                             ports: normalized_ports,
                             protocol: e.protocol,
                             tls: e.tls,
-                            enforcement: e.enforcement,
+                            enforcement: e
+                                .enforcement
+                                .as_ref()
+                                .map(enforcement_def_to_proto_string)
+                                .unwrap_or_default(),
                             access: e.access,
                             rules: e
                                 .rules
@@ -301,6 +400,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 .deny_rules
                                 .into_iter()
                                 .map(|d| L7DenyRule {
+                                    name: d.name,
                                     method: d.method,
                                     path: d.path,
                                     command: d.command,
@@ -430,7 +530,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             ports,
                             protocol: e.protocol.clone(),
                             tls: e.tls.clone(),
-                            enforcement: e.enforcement.clone(),
+                            enforcement: enforcement_def_from_proto_string(&e.enforcement),
                             access: e.access.clone(),
                             rules: e
                                 .rules
@@ -468,6 +568,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 .deny_rules
                                 .iter()
                                 .map(|d| L7DenyRuleDef {
+                                    name: d.name.clone(),
                                     method: d.method.clone(),
                                     path: d.path.clone(),
                                     command: d.command.clone(),
@@ -691,6 +792,13 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
+    /// An interactive enforcement endpoint URL resolves to a loopback or
+    /// link-local address, which can be used to reach internal services or
+    /// cloud metadata endpoints (e.g. 169.254.169.254).
+    UnsafeInteractiveEndpoint {
+        policy_name: String,
+        endpoint: String,
+    },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -725,6 +833,17 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
                      use subdomain wildcards like '*.example.com' instead"
+                )
+            }
+            Self::UnsafeInteractiveEndpoint {
+                policy_name,
+                endpoint,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': interactive enforcement endpoint \
+                     '{endpoint}' resolves to a loopback or link-local address; \
+                     use a hostname (e.g. host.openshell.internal) instead"
                 )
             }
         }
@@ -814,7 +933,8 @@ pub fn validate_sandbox_policy(
         }
     }
 
-    // Check network policy endpoint hosts for TLD wildcards.
+    // Check network policy endpoint hosts for TLD wildcards and unsafe
+    // interactive enforcement endpoints.
     for (key, rule) in &policy.network_policies {
         let name = if rule.name.is_empty() {
             key.clone()
@@ -829,6 +949,28 @@ pub fn validate_sandbox_policy(
                         policy_name: name.clone(),
                         host: ep.host.clone(),
                     });
+                }
+            }
+
+            // Reject interactive enforcement endpoints whose host is a raw IP
+            // in a loopback or link-local range.  These can reach the cloud
+            // instance metadata service (169.254.169.254) or other internal
+            // addresses.  Hostname-based endpoints (e.g. host.openshell.internal)
+            // are allowed; DNS resolution is controlled by the network namespace.
+            if ep.enforcement.trim_start().starts_with('{') {
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(ep.enforcement.trim()) {
+                    if obj.get("mode").and_then(|v| v.as_str()) == Some("interactive") {
+                        if let Some(endpoint_url) = obj.get("endpoint").and_then(|v| v.as_str()) {
+                            if let Some(host) = extract_url_host(endpoint_url) {
+                                if is_unsafe_ip_host(&host) {
+                                    violations.push(PolicyViolation::UnsafeInteractiveEndpoint {
+                                        policy_name: name.clone(),
+                                        endpoint: endpoint_url.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -847,6 +989,52 @@ fn truncate_for_display(s: &str) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..77])
+    }
+}
+
+/// Extract the host component from a URL string (no external dependencies).
+fn extract_url_host(url: &str) -> Option<String> {
+    // Strip scheme
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    // Strip userinfo
+    let rest = if let Some(at) = rest.find('@') {
+        &rest[at + 1..]
+    } else {
+        rest
+    };
+    // Strip path/query/fragment
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    // Strip port
+    let host = if host_port.starts_with('[') {
+        // IPv6 literal [::1]:port
+        host_port
+            .find(']')
+            .map(|i| &host_port[1..i])
+            .unwrap_or(host_port)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port)
+    };
+    Some(host.to_lowercase())
+}
+
+/// Return true if `host` is a raw IP address in a loopback or link-local range.
+fn is_unsafe_ip_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    // fe80::/10 link-local
+                    || (v6.segments()[0] & 0xffc0 == 0xfe80)
+            }
+        }
+    } else {
+        false
     }
 }
 
@@ -1391,6 +1579,75 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_interactive_endpoint_link_local_ip() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    enforcement: r#"{"mode":"interactive","endpoint":"http://169.254.169.254/latest/meta-data/"}"#.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::UnsafeInteractiveEndpoint { .. })),
+            "expected UnsafeInteractiveEndpoint violation, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_interactive_endpoint_loopback_ip() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "loop".into(),
+            NetworkPolicyRule {
+                name: "loop-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    enforcement: r#"{"mode":"interactive","endpoint":"http://127.0.0.1:9000/decide"}"#.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::UnsafeInteractiveEndpoint { .. })),
+            "expected UnsafeInteractiveEndpoint violation, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_interactive_endpoint_hostname() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    enforcement: r#"{"mode":"interactive","endpoint":"http://host.openshell.internal:8080/decide"}"#.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
     fn normalize_path_collapses_separators() {
         assert_eq!(normalize_path("/usr//lib"), "/usr/lib");
         assert_eq!(normalize_path("/usr/./lib"), "/usr/lib");
@@ -1636,6 +1893,49 @@ network_policies:
     }
 
     #[test]
+    fn deny_rule_name_field_accepted_and_preserved() {
+        let yaml = r#"
+version: 1
+network_policies:
+  gate:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        access: full
+        deny_rules:
+          - name: gate-all
+            method: "*"
+            path: "**"
+    binaries:
+      - path: "**"
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let ep = &proto.network_policies["gate"].endpoints[0];
+        assert_eq!(ep.deny_rules.len(), 1);
+        assert_eq!(ep.deny_rules[0].name, "gate-all");
+        assert_eq!(ep.deny_rules[0].method, "*");
+        assert_eq!(ep.deny_rules[0].path, "**");
+
+        // Name survives a round-trip
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(
+            proto2.network_policies["gate"].endpoints[0].deny_rules[0].name,
+            "gate-all"
+        );
+    }
+
+    #[test]
     fn parse_deny_rules_with_query_any() {
         let yaml = r#"
 version: 1
@@ -1816,6 +2116,118 @@ network_policies:
         assert!(
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
+        );
+    }
+
+    #[test]
+    fn enforcement_bare_string_back_compat() {
+        // Existing YAML using bare-string enforcement must keep parsing into
+        // the same proto representation as before.
+        let yaml = r"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        enforcement: enforce
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        assert_eq!(
+            proto.network_policies["test"].endpoints[0].enforcement,
+            "enforce"
+        );
+    }
+
+    #[test]
+    fn enforcement_interactive_object_round_trip() {
+        let yaml = r"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        enforcement:
+          mode: interactive
+          endpoint: http://host.openshell.internal:53789/decide
+          timeout_seconds: 60
+          fallback: deny
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        // Proto stores the object form as a JSON-encoded string.
+        let stored = &proto1.network_policies["test"].endpoints[0].enforcement;
+        assert!(
+            stored.starts_with('{'),
+            "expected JSON-encoded form, got {stored:?}"
+        );
+        assert!(stored.contains("\"mode\":\"interactive\""));
+        assert!(stored.contains("\"endpoint\":\"http://host.openshell.internal:53789/decide\""));
+        assert!(stored.contains("\"timeout_seconds\":60"));
+        assert!(stored.contains("\"fallback\":\"deny\""));
+
+        // Round-trip through YAML preserves the structure.
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(
+            proto1.network_policies["test"].endpoints[0].enforcement,
+            proto2.network_policies["test"].endpoints[0].enforcement
+        );
+        // YAML output uses the human-friendly map form, not JSON-in-a-string.
+        assert!(
+            yaml_out.contains("mode: interactive"),
+            "yaml_out:\n{yaml_out}"
+        );
+        assert!(yaml_out.contains("endpoint: http://host.openshell.internal:53789/decide"));
+    }
+
+    #[test]
+    fn enforcement_interactive_minimal_object() {
+        // Only `mode` and `endpoint` provided — optional fields stay absent.
+        let yaml = r"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        enforcement:
+          mode: interactive
+          endpoint: http://h:1/d
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        assert!(yaml_out.contains("mode: interactive"));
+        // Defaulted fields should not appear in serialized YAML.
+        assert!(!yaml_out.contains("timeout_seconds"));
+        assert!(!yaml_out.contains("fallback"));
+    }
+
+    #[test]
+    fn enforcement_object_rejects_unknown_field() {
+        let yaml = r"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        enforcement:
+          mode: interactive
+          endpoint: http://h:1/d
+          bogus: true
+    binaries:
+      - path: /usr/bin/curl
+";
+        assert!(
+            parse_sandbox_policy(yaml).is_err(),
+            "unknown field under enforcement object should be rejected"
         );
     }
 }
