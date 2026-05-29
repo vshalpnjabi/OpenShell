@@ -141,8 +141,9 @@ pub(crate) struct InteractiveContext<'a> {
     /// Absolute path of the initiating binary.
     pub binary: &'a str,
     /// PID of the initiating binary, if available.
-    /// Relay call sites pass `None` because `L7EvalContext` does not carry
-    /// PID; threading it through is a future improvement.
+    /// Relay call sites pass the PID resolved at L4 CONNECT time (carried on
+    /// `L7EvalContext`), i.e. the same PID the allow/deny path bound to. `None`
+    /// when L4 could not resolve a single owner.
     pub pid: Option<u32>,
     /// HTTP method (e.g. `"GET"`).
     pub method: &'a str,

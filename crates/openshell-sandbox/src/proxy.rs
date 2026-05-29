@@ -834,6 +834,7 @@ async fn handle_tcp_connection(
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        binary_pid: decision.binary_pid,
         ancestors: decision
             .ancestors
             .iter()
@@ -2912,6 +2913,7 @@ async fn handle_forward_proxy(
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        binary_pid: decision.binary_pid,
         ancestors: decision
             .ancestors
             .iter()
@@ -3885,6 +3887,7 @@ mod tests {
             port,
             policy_name: policy_name.to_string(),
             binary_path: "/usr/bin/node".to_string(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -4050,6 +4053,7 @@ mod tests {
             port: 80,
             policy_name: "ws_api".to_string(),
             binary_path: "/usr/bin/node".to_string(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver,
@@ -4090,6 +4094,7 @@ mod tests {
             port: 80,
             policy_name: "rest_api".to_string(),
             binary_path: "/usr/bin/node".to_string(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,

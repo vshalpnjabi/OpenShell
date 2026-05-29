@@ -798,6 +798,7 @@ network_policies:
             port: 8080,
             policy_name: "test_graphql_l7".to_string(),
             binary_path: "/usr/bin/python3".to_string(),
+            binary_pid: None,
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,

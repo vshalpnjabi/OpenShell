@@ -31,6 +31,11 @@ pub struct L7EvalContext {
     pub policy_name: String,
     /// Binary path (for cross-layer Rego evaluation).
     pub binary_path: String,
+    /// PID that owned the socket at L4 CONNECT time, as resolved for the
+    /// network decision. Carried so interactive enforcement can report the
+    /// same PID the allow/deny path bound to. `None` when L4 could not resolve
+    /// a single owner.
+    pub binary_pid: Option<u32>,
     /// Ancestor paths.
     pub ancestors: Vec<String>,
     /// Cmdline paths.
@@ -343,7 +348,7 @@ where
                     host: &ctx.host,
                     port: ctx.port,
                     binary: &ctx.binary_path,
-                    pid: None,
+                    pid: ctx.binary_pid,
                     method: &request_info.action,
                     path: &redacted_target,
                     protocol: protocol_str,
@@ -779,7 +784,7 @@ where
                     host: &ctx.host,
                     port: ctx.port,
                     binary: &ctx.binary_path,
-                    pid: None,
+                    pid: ctx.binary_pid,
                     method: &request_info.action,
                     path: &redacted_target,
                     protocol: protocol_str,
@@ -1054,7 +1059,7 @@ where
                     host: &ctx.host,
                     port: ctx.port,
                     binary: &ctx.binary_path,
-                    pid: None,
+                    pid: ctx.binary_pid,
                     method: &request_info.action,
                     path: &redacted_target,
                     // S1: "graphql" is hardcoded here (not derived from
@@ -1496,6 +1501,7 @@ network_policies:
             port: 443,
             policy_name: "ws_api".into(),
             binary_path: "/usr/bin/node".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -1554,6 +1560,7 @@ network_policies:
             port: 443,
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -1658,6 +1665,7 @@ network_policies:
             port: 443,
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
@@ -1775,6 +1783,7 @@ network_policies:
             port: 443,
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
@@ -1945,6 +1954,7 @@ network_policies:
             port: 8080,
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -2032,6 +2042,7 @@ network_policies:
             port: 8080,
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,

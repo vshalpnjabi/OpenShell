@@ -1305,6 +1305,7 @@ network_policies:
             port: 443,
             policy_name: "graphql_ws".into(),
             binary_path: "/usr/bin/node".into(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
